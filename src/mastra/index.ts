@@ -6,6 +6,7 @@ import { LibSQLStore } from '@mastra/libsql';
 // Workflows
 import { weatherWorkflow } from './workflows/weather-workflow';
 import { githubToBRDWorkflow } from './workflows/github-to-brd.workflow';
+import { prodWorkflow } from './workflows/prod.workflow';
 
 // Agents
 import { weatherAgent } from './agents/weather-agent';
@@ -33,7 +34,8 @@ import { taskValidationTool } from './tools/task-validation.tool';
 export const mastra = new Mastra({
   workflows: { 
     weatherWorkflow, 
-    githubToBRDWorkflow 
+    githubToBRDWorkflow,
+    prodWorkflow
   },
   agents: { 
     // Core workflow agents
@@ -66,6 +68,7 @@ export {
   // Workflows
   weatherWorkflow,
   githubToBRDWorkflow,
+  prodWorkflow,
   
   // Agents
   weatherAgent,
@@ -131,5 +134,6 @@ export const agents = {
 // Export workflows
 export const workflows = {
   weatherWorkflow,
-  githubToBRDWorkflow
+  githubToBRDWorkflow,
+  prodWorkflow
 };
