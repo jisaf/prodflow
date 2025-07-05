@@ -6,7 +6,19 @@ import { LibSQLStore } from '@mastra/libsql';
 // Workflows
 import { weatherWorkflow } from './workflows/weather-workflow';
 import { githubToBRDWorkflow } from './workflows/github-to-brd.workflow';
-import { prodWorkflow } from './workflows/prod.workflow';
+import { 
+  prodWorkflow,
+  analyzeAndGenerateBRDWorkflow,
+  taskBreakdownWorkflow,
+  designAgentWorkflow,
+  frontendAgentWorkflow,
+  backendAgentWorkflow,
+  devopsAgentWorkflow,
+  testingAgentWorkflow,
+  documentationAgentWorkflow,
+  integrationAgentWorkflow,
+  artifactPublishingWorkflow
+} from './workflows/prod.workflow';
 
 // Agents
 import { weatherAgent } from './agents/weather-agent';
@@ -33,9 +45,24 @@ import { taskValidationTool } from './tools/task-validation.tool';
 
 export const mastra = new Mastra({
   workflows: { 
+    // Original workflows
     weatherWorkflow, 
     githubToBRDWorkflow,
-    prodWorkflow
+    
+    // Production workflow (main orchestrator)
+    prodWorkflow,
+    
+    // Sub-workflows for modular execution
+    'analyze-and-generate-brd': analyzeAndGenerateBRDWorkflow,
+    'task-breakdown-and-distribution': taskBreakdownWorkflow,
+    'design-agent-execution': designAgentWorkflow,
+    'frontend-agent-execution': frontendAgentWorkflow,
+    'backend-agent-execution': backendAgentWorkflow,
+    'devops-agent-execution': devopsAgentWorkflow,
+    'testing-agent-execution': testingAgentWorkflow,
+    'documentation-agent-execution': documentationAgentWorkflow,
+    'integration-agent-execution': integrationAgentWorkflow,
+    'artifact-publishing': artifactPublishingWorkflow
   },
   agents: { 
     // Core workflow agents
@@ -69,6 +96,16 @@ export {
   weatherWorkflow,
   githubToBRDWorkflow,
   prodWorkflow,
+  analyzeAndGenerateBRDWorkflow,
+  taskBreakdownWorkflow,
+  designAgentWorkflow,
+  frontendAgentWorkflow,
+  backendAgentWorkflow,
+  devopsAgentWorkflow,
+  testingAgentWorkflow,
+  documentationAgentWorkflow,
+  integrationAgentWorkflow,
+  artifactPublishingWorkflow,
   
   // Agents
   weatherAgent,
@@ -133,7 +170,20 @@ export const agents = {
 
 // Export workflows
 export const workflows = {
+  // Core workflows
   weatherWorkflow,
   githubToBRDWorkflow,
-  prodWorkflow
+  prodWorkflow,
+  
+  // Specialized agent workflows
+  analyzeAndGenerateBRDWorkflow,
+  taskBreakdownWorkflow,
+  designAgentWorkflow,
+  frontendAgentWorkflow,
+  backendAgentWorkflow,
+  devopsAgentWorkflow,
+  testingAgentWorkflow,
+  documentationAgentWorkflow,
+  integrationAgentWorkflow,
+  artifactPublishingWorkflow
 };

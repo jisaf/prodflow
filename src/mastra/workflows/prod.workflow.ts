@@ -2,8 +2,7 @@ import { createWorkflow, createStep } from "@mastra/core";
 import { z } from "zod";
 import { githubIssuesTool } from "../tools/github-issues.tool";
 import { generateBRD, postBRDToGitHub, postTasksToGitHub } from "../agents/brd-generator.agent";
-import { breakdownBRDIntoTasks, validateTaskBreakdown } from "../agents/task-master.agent";
-import { githubTaskPickupTool } from "../tools/github-task-pickup.tool";
+import { breakdownBRDIntoTasks } from "../agents/task-master.agent";
 import { githubArtifactPosterTool } from "../tools/github-artifact-poster.tool";
 
 // Import specialized agents
@@ -15,85 +14,25 @@ import { processTestingTask } from "../agents/testing.agent";
 import { processDocumentationTask } from "../agents/documentation.agent";
 import { processIntegrationTask } from "../agents/integration.agent";
 
-// Workflow Input Schema
-const workflowInputSchema = z.object({
-  owner: z.string().describe("GitHub repository owner"),
-  repo: z.string().describe("GitHub repository name"),
-  issueFilters: z.object({
-    state: z.enum(["open", "closed", "all"]).default("open"),
-    labels: z.array(z.string()).optional(),
-    assignee: z.string().optional(),
-    limit: z.number().min(1).max(50).default(20)
-  }).optional(),
-  projectContext: z.object({
-    projectName: z.string(),
-    stakeholders: z.array(z.string()),
-    businessObjectives: z.array(z.string()),
-    constraints: z.array(z.string()).optional(),
-    technologyStack: z.array(z.string()).default(["JavaScript", "Node.js", "React"])
-  }).describe("Project context and technology stack"),
-  executionConfig: z.object({
-    enableTaskGeneration: z.boolean().default(true),
-    enableTaskExecution: z.boolean().default(true),
-    maxConcurrentTasks: z.number().min(1).max(10).default(3),
-    categories: z.array(z.enum([
-      "design", "frontend", "backend", "devops", "testing", "documentation", "integration"
-    ])).optional(),
-    priority: z.enum(["critical", "high", "medium", "low"]).optional(),
-    autoCommit: z.boolean().default(false)
-  }).default({
-    enableTaskGeneration: true,
-    enableTaskExecution: true,
-    maxConcurrentTasks: 3,
-    autoCommit: false
-  })
+// Base schemas
+const projectContextSchema = z.object({
+  projectName: z.string(),
+  stakeholders: z.array(z.string()),
+  businessObjectives: z.array(z.string()),
+  constraints: z.array(z.string()).optional(),
+  technologyStack: z.array(z.string()).default(["JavaScript", "Node.js", "React"])
 });
 
-// Shared schemas for data flow
-const analysisResultSchema = z.object({
-  owner: z.string(),
-  repo: z.string(),
-  projectContext: z.object({
-    projectName: z.string(),
-    stakeholders: z.array(z.string()),
-    businessObjectives: z.array(z.string()),
-    constraints: z.array(z.string()).optional(),
-    technologyStack: z.array(z.string())
-  }),
-  executionConfig: z.object({
-    enableTaskGeneration: z.boolean(),
-    enableTaskExecution: z.boolean(),
-    maxConcurrentTasks: z.number(),
-    categories: z.array(z.string()).optional(),
-    priority: z.string().optional(),
-    autoCommit: z.boolean()
-  }),
-  issues: z.array(z.any()),
-  analysis: z.object({
-    totalIssues: z.number(),
-    openIssues: z.number(),
-    closedIssues: z.number(),
-    topLabels: z.array(z.string())
-  })
-});
-
-const brdResultSchema = analysisResultSchema.extend({
-  brd: z.string(),
-  brdPosted: z.boolean()
-});
-
-const taskResultSchema = brdResultSchema.extend({
-  tasks: z.array(z.object({
-    id: z.string(),
-    title: z.string(),
-    description: z.string(),
-    category: z.enum(["design", "frontend", "backend", "devops", "testing", "documentation", "integration"]),
-    priority: z.enum(["critical", "high", "medium", "low"]),
-    complexity: z.enum(["simple", "moderate", "complex"]),
-    dependencies: z.array(z.string()),
-    acceptanceCriteria: z.array(z.string()),
-    issueNumber: z.number().optional()
-  }))
+const taskSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  description: z.string(),
+  category: z.enum(["design", "frontend", "backend", "devops", "testing", "documentation", "integration"]),
+  priority: z.enum(["critical", "high", "medium", "low"]),
+  complexity: z.enum(["simple", "moderate", "complex"]),
+  dependencies: z.array(z.string()),
+  acceptanceCriteria: z.array(z.string()),
+  issueNumber: z.number().optional()
 });
 
 const taskExecutionResultSchema = z.object({
@@ -111,18 +50,105 @@ const taskExecutionResultSchema = z.object({
   message: z.string()
 });
 
-// Step 1: Issue Analysis
-const analyzeIssuesStep = createStep({
-  id: "analyze-github-issues",
-  description: "Analyze GitHub issues and extract project requirements",
+// Main workflow input
+const workflowInputSchema = z.object({
+  owner: z.string().describe("GitHub repository owner"),
+  repo: z.string().describe("GitHub repository name"),
+  issueFilters: z.object({
+    state: z.enum(["open", "closed", "all"]).default("open"),
+    labels: z.array(z.string()).optional(),
+    assignee: z.string().optional(),
+    limit: z.number().min(1).max(50).default(20)
+  }).optional(),
+  projectContext: projectContextSchema,
+  executionConfig: z.object({
+    enableTaskGeneration: z.boolean().default(true),
+    enableTaskExecution: z.boolean().default(true),
+    categories: z.array(z.enum([
+      "design", "frontend", "backend", "devops", "testing", "documentation", "integration"
+    ])).optional(),
+    priority: z.enum(["critical", "high", "medium", "low"]).optional(),
+    autoCommit: z.boolean().default(false)
+  }).default({
+    enableTaskGeneration: true,
+    enableTaskExecution: true,
+    autoCommit: false
+  })
+});
+
+// Task distribution schema for parallel execution
+const taskDistributionSchema = z.object({
+  owner: z.string(),
+  repo: z.string(),
+  projectContext: projectContextSchema,
+  executionConfig: z.object({
+    enableTaskExecution: z.boolean(),
+    categories: z.array(z.string()).optional(),
+    priority: z.string().optional(),
+    autoCommit: z.boolean()
+  }),
+  designTasks: z.array(taskSchema),
+  frontendTasks: z.array(taskSchema),
+  backendTasks: z.array(taskSchema),
+  devopsTasks: z.array(taskSchema),
+  testingTasks: z.array(taskSchema),
+  documentationTasks: z.array(taskSchema),
+  integrationTasks: z.array(taskSchema)
+});
+
+// PHASE 1: Issue Analysis and BRD Generation
+const analyzeAndGenerateBRDWorkflow = createWorkflow({
+  id: "analyze-and-generate-brd",
   inputSchema: workflowInputSchema,
-  outputSchema: analysisResultSchema,
+  outputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    projectContext: projectContextSchema,
+    executionConfig: z.object({
+      enableTaskGeneration: z.boolean(),
+      enableTaskExecution: z.boolean(),
+      categories: z.array(z.string()).optional(),
+      priority: z.string().optional(),
+      autoCommit: z.boolean()
+    }),
+    analysis: z.object({
+      totalIssues: z.number(),
+      openIssues: z.number(),
+      closedIssues: z.number(),
+      topLabels: z.array(z.string())
+    }),
+    brd: z.string(),
+    brdPosted: z.boolean()
+  })
+})
+.then(createStep({
+  id: "analyze-github-issues",
+  description: "Analyze GitHub issues and extract requirements",
+  inputSchema: workflowInputSchema,
+  outputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    projectContext: projectContextSchema,
+    executionConfig: z.object({
+      enableTaskGeneration: z.boolean(),
+      enableTaskExecution: z.boolean(),
+      categories: z.array(z.string()).optional(),
+      priority: z.string().optional(),
+      autoCommit: z.boolean()
+    }),
+    issues: z.array(z.any()),
+    analysis: z.object({
+      totalIssues: z.number(),
+      openIssues: z.number(),
+      closedIssues: z.number(),
+      topLabels: z.array(z.string())
+    })
+  }),
   execute: async ({ inputData }) => {
     const { owner, repo, issueFilters, projectContext, executionConfig } = inputData;
     
     console.log(`🔍 Analyzing GitHub issues from ${owner}/${repo}...`);
     
-    // Fetch GitHub issues
     const issuesResult = await githubIssuesTool.execute({
       context: {
         owner,
@@ -137,8 +163,6 @@ const analyzeIssuesStep = createStep({
     });
     
     const issues = issuesResult.issues || [];
-    
-    // Analyze issues
     const openIssues = issues.filter((i: any) => i.state === 'open').length;
     const closedIssues = issues.filter((i: any) => i.state === 'closed').length;
     const labelCounts = new Map();
@@ -170,20 +194,54 @@ const analyzeIssuesStep = createStep({
       }
     };
   }
-});
-
-// Step 2: BRD Generation
-const generateBRDStep = createStep({
-  id: "generate-business-requirements",
-  description: "Generate Business Requirements Document from analyzed issues",
-  inputSchema: analysisResultSchema,
-  outputSchema: brdResultSchema,
+}))
+.then(createStep({
+  id: "generate-brd",
+  description: "Generate Business Requirements Document",
+  inputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    projectContext: projectContextSchema,
+    executionConfig: z.object({
+      enableTaskGeneration: z.boolean(),
+      enableTaskExecution: z.boolean(),
+      categories: z.array(z.string()).optional(),
+      priority: z.string().optional(),
+      autoCommit: z.boolean()
+    }),
+    issues: z.array(z.any()),
+    analysis: z.object({
+      totalIssues: z.number(),
+      openIssues: z.number(),
+      closedIssues: z.number(),
+      topLabels: z.array(z.string())
+    })
+  }),
+  outputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    projectContext: projectContextSchema,
+    executionConfig: z.object({
+      enableTaskGeneration: z.boolean(),
+      enableTaskExecution: z.boolean(),
+      categories: z.array(z.string()).optional(),
+      priority: z.string().optional(),
+      autoCommit: z.boolean()
+    }),
+    analysis: z.object({
+      totalIssues: z.number(),
+      openIssues: z.number(),
+      closedIssues: z.number(),
+      topLabels: z.array(z.string())
+    }),
+    brd: z.string(),
+    brdPosted: z.boolean()
+  }),
   execute: async ({ inputData }) => {
     const { owner, repo, projectContext, executionConfig, issues, analysis } = inputData;
     
     console.log(`📄 Generating Business Requirements Document...`);
     
-    // Generate BRD using the agent
     const brd = await generateBRD({ issues }, {
       projectName: projectContext.projectName,
       stakeholders: projectContext.stakeholders,
@@ -191,7 +249,6 @@ const generateBRDStep = createStep({
       constraints: projectContext.constraints
     });
     
-    // Post BRD to GitHub
     const brdPostResults = await postBRDToGitHub(
       brd,
       owner,
@@ -205,30 +262,75 @@ const generateBRDStep = createStep({
     console.log(`✅ BRD generated and posted to GitHub: ${brdPosted}`);
     
     return {
-      ...inputData,
+      owner,
+      repo,
+      projectContext,
+      executionConfig,
+      analysis,
       brd,
       brdPosted
     };
   }
-});
+}))
+.commit();
 
-// Step 3: Task Breakdown
-const breakdownTasksStep = createStep({
-  id: "breakdown-into-tasks",
-  description: "Break down BRD into discrete AI-executable tasks",
-  inputSchema: brdResultSchema,
-  outputSchema: taskResultSchema,
+// PHASE 2: Task Breakdown and Distribution
+const taskBreakdownWorkflow = createWorkflow({
+  id: "task-breakdown-and-distribution",
+  inputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    projectContext: projectContextSchema,
+    executionConfig: z.object({
+      enableTaskGeneration: z.boolean(),
+      enableTaskExecution: z.boolean(),
+      categories: z.array(z.string()).optional(),
+      priority: z.string().optional(),
+      autoCommit: z.boolean()
+    }),
+    brd: z.string()
+  }),
+  outputSchema: taskDistributionSchema
+})
+.then(createStep({
+  id: "breakdown-brd-into-tasks",
+  description: "Break down BRD into categorized tasks for specialized agents",
+  inputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    projectContext: projectContextSchema,
+    executionConfig: z.object({
+      enableTaskGeneration: z.boolean(),
+      enableTaskExecution: z.boolean(),
+      categories: z.array(z.string()).optional(),
+      priority: z.string().optional(),
+      autoCommit: z.boolean()
+    }),
+    brd: z.string()
+  }),
+  outputSchema: taskDistributionSchema,
   execute: async ({ inputData }) => {
-    const { brd, projectContext, executionConfig } = inputData;
+    const { owner, repo, projectContext, executionConfig, brd } = inputData;
     
     if (!executionConfig.enableTaskGeneration) {
       console.log("⏭️ Task generation disabled, skipping...");
-      return { ...inputData, tasks: [] };
+      return {
+        owner,
+        repo,
+        projectContext,
+        executionConfig,
+        designTasks: [],
+        frontendTasks: [],
+        backendTasks: [],
+        devopsTasks: [],
+        testingTasks: [],
+        documentationTasks: [],
+        integrationTasks: []
+      };
     }
     
     console.log(`🔨 Breaking down BRD into executable tasks...`);
     
-    // Break down BRD into tasks
     const taskProjectContext = {
       projectName: projectContext.projectName,
       technology: projectContext.technologyStack,
@@ -237,21 +339,18 @@ const breakdownTasksStep = createStep({
     };
     
     const taskBreakdownText = await breakdownBRDIntoTasks(brd, taskProjectContext);
+    const allTasks = parseTasksFromBreakdown(taskBreakdownText);
     
-    // Parse tasks from the breakdown (simplified parsing)
-    const tasks = parseTasksFromBreakdown(taskBreakdownText);
-    
-    // Post tasks to GitHub as issues
-    if (tasks.length > 0) {
+    // Post tasks to GitHub and update with issue numbers
+    if (allTasks.length > 0) {
       const taskPostResults = await postTasksToGitHub(
-        tasks,
-        inputData.owner,
-        inputData.repo,
+        allTasks,
+        owner,
+        repo,
         { projectName: projectContext.projectName, technologyStack: projectContext.technologyStack }
       );
       
-      // Update tasks with issue numbers
-      tasks.forEach((task: any, index: number) => {
+      allTasks.forEach((task: any, index: number) => {
         const postResult = taskPostResults[index];
         if (postResult?.success && postResult.issueNumber) {
           task.issueNumber = postResult.issueNumber;
@@ -259,37 +358,10 @@ const breakdownTasksStep = createStep({
       });
     }
     
-    console.log(`✅ Generated ${tasks.length} executable tasks`);
-    
-    return {
-      ...inputData,
-      tasks
-    };
-  }
-});
-
-// Step 4: Task Execution Coordinator
-const coordinateTaskExecutionStep = createStep({
-  id: "coordinate-task-execution",
-  description: "Coordinate parallel execution of tasks by specialized agents",
-  inputSchema: taskResultSchema,
-  outputSchema: taskResultSchema.extend({
-    executionResults: z.array(taskExecutionResultSchema)
-  }),
-  execute: async ({ inputData }) => {
-    const { tasks, executionConfig, projectContext } = inputData;
-    
-    if (!executionConfig.enableTaskExecution || tasks.length === 0) {
-      console.log("⏭️ Task execution disabled or no tasks available");
-      return { ...inputData, executionResults: [] };
-    }
-    
-    console.log(`🚀 Coordinating execution of ${tasks.length} tasks...`);
-    
     // Filter tasks based on configuration
-    let filteredTasks = tasks;
+    let filteredTasks = allTasks;
     if (executionConfig.categories) {
-      filteredTasks = tasks.filter((task: any) => 
+      filteredTasks = allTasks.filter((task: any) => 
         executionConfig.categories!.includes(task.category)
       );
     }
@@ -302,62 +374,67 @@ const coordinateTaskExecutionStep = createStep({
       );
     }
     
-    // Group tasks by category for parallel execution
-    const tasksByCategory = filteredTasks.reduce((acc: any, task: any) => {
-      if (!acc[task.category]) acc[task.category] = [];
-      acc[task.category].push(task);
-      return acc;
-    }, {});
-    
-    console.log(`📊 Task distribution: ${Object.keys(tasksByCategory).join(', ')}`);
-    
-    // Execute tasks in parallel by category (up to maxConcurrentTasks)
-    const executionPromises = Object.entries(tasksByCategory)
-      .slice(0, executionConfig.maxConcurrentTasks)
-      .map(([category, categoryTasks]: [string, any]) => 
-        executeCategoryTasks(category, categoryTasks, projectContext)
-      );
-    
-    const categoryResults = await Promise.allSettled(executionPromises);
-    
-    // Flatten results
-    const executionResults: any[] = [];
-    categoryResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        executionResults.push(...result.value);
-      } else {
-        console.error(`❌ Category execution failed:`, result.reason);
-      }
-    });
-    
-    console.log(`✅ Task execution complete: ${executionResults.length} results`);
-    
-    return {
-      ...inputData,
-      executionResults
+    // Distribute tasks by category
+    const taskDistribution = {
+      owner,
+      repo,
+      projectContext,
+      executionConfig,
+      designTasks: filteredTasks.filter((task: any) => task.category === 'design'),
+      frontendTasks: filteredTasks.filter((task: any) => task.category === 'frontend'),
+      backendTasks: filteredTasks.filter((task: any) => task.category === 'backend'),
+      devopsTasks: filteredTasks.filter((task: any) => task.category === 'devops'),
+      testingTasks: filteredTasks.filter((task: any) => task.category === 'testing'),
+      documentationTasks: filteredTasks.filter((task: any) => task.category === 'documentation'),
+      integrationTasks: filteredTasks.filter((task: any) => task.category === 'integration')
     };
+    
+    console.log(`✅ Task distribution complete:`);
+    console.log(`  🎨 Design: ${taskDistribution.designTasks.length}`);
+    console.log(`  ⚛️ Frontend: ${taskDistribution.frontendTasks.length}`);
+    console.log(`  🔧 Backend: ${taskDistribution.backendTasks.length}`);
+    console.log(`  🚀 DevOps: ${taskDistribution.devopsTasks.length}`);
+    console.log(`  🧪 Testing: ${taskDistribution.testingTasks.length}`);
+    console.log(`  📚 Documentation: ${taskDistribution.documentationTasks.length}`);
+    console.log(`  🔌 Integration: ${taskDistribution.integrationTasks.length}`);
+    
+    return taskDistribution;
   }
-});
+}))
+.commit();
 
-// Specialized Agent Execution Steps
-const executeDesignTasksStep = createStep({
-  id: "execute-design-tasks",
-  description: "Execute design tasks using Design Agent",
+// PHASE 3A: Design Agent Workflow
+const designAgentWorkflow = createWorkflow({
+  id: "design-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-design-tasks",
+  description: "🎨 Execute design tasks using Design Agent (Claude Sonnet 4)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const designTasks = tasks.filter((task: any) => task.category === 'design');
     
-    console.log(`🎨 Executing ${designTasks.length} design tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`🎨 Design Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      designTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processDesignTask(task, {
@@ -373,7 +450,7 @@ const executeDesignTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'Design specifications completed successfully'
+            message: '🎨 Design specifications completed successfully'
           };
         } catch (error) {
           return {
@@ -382,41 +459,59 @@ const executeDesignTasksStep = createStep({
             category: 'design' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ Design task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ Design Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-const executeFrontendTasksStep = createStep({
-  id: "execute-frontend-tasks",
-  description: "Execute frontend tasks using Frontend Agent",
+// PHASE 3B: Frontend Agent Workflow
+const frontendAgentWorkflow = createWorkflow({
+  id: "frontend-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-frontend-tasks",
+  description: "⚛️ Execute frontend tasks using Frontend Agent (Claude Sonnet 4)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const frontendTasks = tasks.filter((task: any) => task.category === 'frontend');
     
-    console.log(`⚛️ Executing ${frontendTasks.length} frontend tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`⚛️ Frontend Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      frontendTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processFrontendTask(task, {
             technologyStack: projectContext.technologyStack,
-            framework: projectContext.framework || 'React',
-            stylingApproach: projectContext.stylingApproach,
-            stateManagement: projectContext.stateManagement
+            framework: 'React',
+            stylingApproach: 'CSS Modules',
+            stateManagement: 'React Hooks'
           });
           
           return {
@@ -426,7 +521,7 @@ const executeFrontendTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'Frontend implementation completed successfully'
+            message: '⚛️ Frontend implementation completed successfully'
           };
         } catch (error) {
           return {
@@ -435,41 +530,59 @@ const executeFrontendTasksStep = createStep({
             category: 'frontend' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ Frontend task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ Frontend Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-const executeBackendTasksStep = createStep({
-  id: "execute-backend-tasks",
-  description: "Execute backend tasks using Backend Agent",
+// PHASE 3C: Backend Agent Workflow
+const backendAgentWorkflow = createWorkflow({
+  id: "backend-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-backend-tasks",
+  description: "🔧 Execute backend tasks using Backend Agent (GPT-4o)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const backendTasks = tasks.filter((task: any) => task.category === 'backend');
     
-    console.log(`🔧 Executing ${backendTasks.length} backend tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`🔧 Backend Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      backendTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processBackendTask(task, {
             technologyStack: projectContext.technologyStack,
-            database: projectContext.database || 'PostgreSQL',
-            authStrategy: projectContext.authStrategy,
-            deploymentTarget: projectContext.deploymentTarget
+            database: 'PostgreSQL',
+            authStrategy: 'JWT',
+            deploymentTarget: 'Docker'
           });
           
           return {
@@ -479,7 +592,7 @@ const executeBackendTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'Backend implementation completed successfully'
+            message: '🔧 Backend implementation completed successfully'
           };
         } catch (error) {
           return {
@@ -488,41 +601,59 @@ const executeBackendTasksStep = createStep({
             category: 'backend' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ Backend task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ Backend Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-const executeDevOpsTasksStep = createStep({
-  id: "execute-devops-tasks",
-  description: "Execute DevOps tasks using DevOps Agent",
+// PHASE 3D: DevOps Agent Workflow
+const devopsAgentWorkflow = createWorkflow({
+  id: "devops-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-devops-tasks",
+  description: "🚀 Execute DevOps tasks using DevOps Agent (GPT-4o)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const devopsTasks = tasks.filter((task: any) => task.category === 'devops');
     
-    console.log(`🚀 Executing ${devopsTasks.length} DevOps tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`🚀 DevOps Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      devopsTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processDevOpsTask(task, {
             technologyStack: projectContext.technologyStack,
-            cloudProvider: projectContext.cloudProvider || 'AWS',
-            environment: projectContext.environment || 'production',
-            scalingRequirements: projectContext.scalingRequirements
+            cloudProvider: 'AWS',
+            environment: 'production',
+            scalingRequirements: 'auto-scaling'
           });
           
           return {
@@ -532,7 +663,7 @@ const executeDevOpsTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'DevOps implementation completed successfully'
+            message: '🚀 DevOps implementation completed successfully'
           };
         } catch (error) {
           return {
@@ -541,41 +672,59 @@ const executeDevOpsTasksStep = createStep({
             category: 'devops' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ DevOps task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ DevOps Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-const executeTestingTasksStep = createStep({
-  id: "execute-testing-tasks",
-  description: "Execute testing tasks using Testing Agent",
+// PHASE 3E: Testing Agent Workflow
+const testingAgentWorkflow = createWorkflow({
+  id: "testing-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-testing-tasks",
+  description: "🧪 Execute testing tasks using Testing Agent (Claude Sonnet 4)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const testingTasks = tasks.filter((task: any) => task.category === 'testing');
     
-    console.log(`🧪 Executing ${testingTasks.length} testing tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`🧪 Testing Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      testingTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processTestingTask(task, {
             technologyStack: projectContext.technologyStack,
-            testingFramework: projectContext.testingFramework || 'Jest',
-            coverageTarget: projectContext.coverageTarget || 80,
-            performanceRequirements: projectContext.performanceRequirements
+            testingFramework: 'Jest',
+            coverageTarget: 80,
+            performanceRequirements: 'standard'
           });
           
           return {
@@ -585,7 +734,7 @@ const executeTestingTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'Testing implementation completed successfully'
+            message: '🧪 Testing implementation completed successfully'
           };
         } catch (error) {
           return {
@@ -594,41 +743,59 @@ const executeTestingTasksStep = createStep({
             category: 'testing' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ Testing task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ Testing Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-const executeDocumentationTasksStep = createStep({
-  id: "execute-documentation-tasks",
-  description: "Execute documentation tasks using Documentation Agent",
+// PHASE 3F: Documentation Agent Workflow
+const documentationAgentWorkflow = createWorkflow({
+  id: "documentation-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-documentation-tasks",
+  description: "📚 Execute documentation tasks using Documentation Agent (Claude Sonnet 4)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const docTasks = tasks.filter((task: any) => task.category === 'documentation');
     
-    console.log(`📚 Executing ${docTasks.length} documentation tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`📚 Documentation Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      docTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processDocumentationTask(task, {
             technologyStack: projectContext.technologyStack,
             audience: ['developers', 'users'],
             documentationType: 'technical',
-            existingDocs: projectContext.existingDocs
+            existingDocs: []
           });
           
           return {
@@ -638,7 +805,7 @@ const executeDocumentationTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'Documentation completed successfully'
+            message: '📚 Documentation completed successfully'
           };
         } catch (error) {
           return {
@@ -647,41 +814,59 @@ const executeDocumentationTasksStep = createStep({
             category: 'documentation' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ Documentation task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ Documentation Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-const executeIntegrationTasksStep = createStep({
-  id: "execute-integration-tasks",
-  description: "Execute integration tasks using Integration Agent",
+// PHASE 3G: Integration Agent Workflow
+const integrationAgentWorkflow = createWorkflow({
+  id: "integration-agent-execution",
   inputSchema: z.object({
-    tasks: z.array(z.any()),
-    projectContext: z.any()
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
+  }),
+  outputSchema: z.object({
+    results: z.array(taskExecutionResultSchema)
+  })
+})
+.then(createStep({
+  id: "execute-integration-tasks",
+  description: "🔌 Execute integration tasks using Integration Agent (GPT-4o)",
+  inputSchema: z.object({
+    tasks: z.array(taskSchema),
+    projectContext: projectContextSchema
   }),
   outputSchema: z.object({
     results: z.array(taskExecutionResultSchema)
   }),
   execute: async ({ inputData }) => {
     const { tasks, projectContext } = inputData;
-    const integrationTasks = tasks.filter((task: any) => task.category === 'integration');
     
-    console.log(`🔌 Executing ${integrationTasks.length} integration tasks...`);
+    if (tasks.length === 0) {
+      return { results: [] };
+    }
+    
+    console.log(`🔌 Integration Agent executing ${tasks.length} tasks...`);
     
     const results = await Promise.all(
-      integrationTasks.map(async (task: any) => {
+      tasks.map(async (task: any) => {
         const startTime = Date.now();
         try {
           const result = await processIntegrationTask(task, {
             technologyStack: projectContext.technologyStack,
             integrationType: 'api',
-            dataVolume: projectContext.dataVolume,
-            securityRequirements: projectContext.securityRequirements
+            dataVolume: 'medium',
+            securityRequirements: ['authentication', 'encryption']
           });
           
           return {
@@ -691,7 +876,7 @@ const executeIntegrationTasksStep = createStep({
             status: 'completed' as const,
             artifact: result.artifacts,
             executionTime: Date.now() - startTime,
-            message: 'Integration implementation completed successfully'
+            message: '🔌 Integration implementation completed successfully'
           };
         } catch (error) {
           return {
@@ -700,22 +885,53 @@ const executeIntegrationTasksStep = createStep({
             category: 'integration' as const,
             status: 'failed' as const,
             executionTime: Date.now() - startTime,
-            message: error instanceof Error ? error.message : String(error)
+            message: `❌ Integration task failed: ${error instanceof Error ? error.message : String(error)}`
           };
         }
       })
     );
     
+    const successful = results.filter(r => r.status === 'completed').length;
+    console.log(`✅ Integration Agent complete: ${successful}/${results.length} tasks successful`);
+    
     return { results };
   }
-});
+}))
+.commit();
 
-// Step 5: Artifact Publishing
-const publishArtifactsStep = createStep({
-  id: "publish-artifacts",
-  description: "Publish all generated artifacts back to GitHub",
-  inputSchema: taskResultSchema.extend({
-    executionResults: z.array(taskExecutionResultSchema)
+// PHASE 4: Artifact Publishing Workflow
+const artifactPublishingWorkflow = createWorkflow({
+  id: "artifact-publishing",
+  inputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    allTasks: z.array(taskSchema),
+    allResults: z.array(taskExecutionResultSchema)
+  }),
+  outputSchema: z.object({
+    publishResults: z.array(z.object({
+      taskId: z.string(),
+      category: z.string(),
+      success: z.boolean(),
+      artifactUrl: z.string().optional(),
+      message: z.string()
+    })),
+    summary: z.object({
+      totalTasks: z.number(),
+      successful: z.number(),
+      failed: z.number(),
+      published: z.number()
+    })
+  })
+})
+.then(createStep({
+  id: "publish-all-artifacts",
+  description: "📤 Publish all generated artifacts back to GitHub",
+  inputSchema: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    allTasks: z.array(taskSchema),
+    allResults: z.array(taskExecutionResultSchema)
   }),
   outputSchema: z.object({
     publishResults: z.array(z.object({
@@ -733,12 +949,12 @@ const publishArtifactsStep = createStep({
     })
   }),
   execute: async ({ inputData }) => {
-    const { owner, repo, executionResults } = inputData;
+    const { owner, repo, allTasks, allResults } = inputData;
     
-    console.log(`📤 Publishing ${executionResults.length} artifacts to GitHub...`);
+    console.log(`📤 Publishing ${allResults.length} artifacts to GitHub...`);
     
     const publishResults = await Promise.all(
-      executionResults.map(async (result: any) => {
+      allResults.map(async (result: any) => {
         if (result.status !== 'completed' || !result.artifact) {
           return {
             taskId: result.taskId,
@@ -749,7 +965,6 @@ const publishArtifactsStep = createStep({
         }
         
         try {
-          // Map category to artifact type
           const artifactTypeMap: Record<string, string> = {
             "design": "design-specifications",
             "frontend": "frontend-code",
@@ -761,9 +976,7 @@ const publishArtifactsStep = createStep({
           };
           
           const artifactType = artifactTypeMap[result.category] || "backend-code";
-          
-          // Find corresponding task for issue number
-          const task = inputData.tasks.find((t: any) => t.id === result.taskId);
+          const task = allTasks.find((t: any) => t.id === result.taskId);
           const issueNumber = task?.issueNumber;
           
           if (!issueNumber) {
@@ -811,9 +1024,9 @@ const publishArtifactsStep = createStep({
     );
     
     const summary = {
-      totalTasks: executionResults.length,
-      successful: executionResults.filter((r: any) => r.status === 'completed').length,
-      failed: executionResults.filter((r: any) => r.status === 'failed').length,
+      totalTasks: allResults.length,
+      successful: allResults.filter((r: any) => r.status === 'completed').length,
+      failed: allResults.filter((r: any) => r.status === 'failed').length,
       published: publishResults.filter((r: any) => r.success).length
     };
     
@@ -821,100 +1034,277 @@ const publishArtifactsStep = createStep({
     
     return { publishResults, summary };
   }
-});
+}))
+.commit();
 
-// Helper function to execute tasks by category
-async function executeCategoryTasks(category: string, tasks: any[], projectContext: any) {
-  const results = [];
-  
-  for (const task of tasks) {
-    const startTime = Date.now();
-    try {
-      let result;
-      
-      switch (category) {
-        case 'design':
-          result = await processDesignTask(task, {
-            technologyStack: projectContext.technologyStack,
-            designSystem: projectContext.designSystem,
-            brandGuidelines: projectContext.brandGuidelines
-          });
-          break;
-        case 'frontend':
-          result = await processFrontendTask(task, {
-            technologyStack: projectContext.technologyStack,
-            framework: projectContext.framework || 'React',
-            stylingApproach: projectContext.stylingApproach,
-            stateManagement: projectContext.stateManagement
-          });
-          break;
-        case 'backend':
-          result = await processBackendTask(task, {
-            technologyStack: projectContext.technologyStack,
-            database: projectContext.database || 'PostgreSQL',
-            authStrategy: projectContext.authStrategy,
-            deploymentTarget: projectContext.deploymentTarget
-          });
-          break;
-        case 'devops':
-          result = await processDevOpsTask(task, {
-            technologyStack: projectContext.technologyStack,
-            cloudProvider: projectContext.cloudProvider || 'AWS',
-            environment: projectContext.environment || 'production',
-            scalingRequirements: projectContext.scalingRequirements
-          });
-          break;
-        case 'testing':
-          result = await processTestingTask(task, {
-            technologyStack: projectContext.technologyStack,
-            testingFramework: projectContext.testingFramework || 'Jest',
-            coverageTarget: projectContext.coverageTarget || 80,
-            performanceRequirements: projectContext.performanceRequirements
-          });
-          break;
-        case 'documentation':
-          result = await processDocumentationTask(task, {
-            technologyStack: projectContext.technologyStack,
-            audience: ['developers', 'users'],
-            documentationType: 'technical',
-            existingDocs: projectContext.existingDocs
-          });
-          break;
-        case 'integration':
-          result = await processIntegrationTask(task, {
-            technologyStack: projectContext.technologyStack,
-            integrationType: 'api',
-            dataVolume: projectContext.dataVolume,
-            securityRequirements: projectContext.securityRequirements
-          });
-          break;
-        default:
-          throw new Error(`Unsupported task category: ${category}`);
-      }
-      
-      results.push({
-        taskId: task.id,
-        title: task.title,
-        category: category as any,
-        status: 'completed' as const,
-        artifact: result.artifacts,
-        executionTime: Date.now() - startTime,
-        message: `${category} implementation completed successfully`
-      });
-    } catch (error) {
-      results.push({
-        taskId: task.id,
-        title: task.title,
-        category: category as any,
-        status: 'failed' as const,
-        executionTime: Date.now() - startTime,
-        message: error instanceof Error ? error.message : String(error)
-      });
+// MAIN PRODUCTION WORKFLOW - Orchestrates all phases with parallel agent execution
+export const prodWorkflow = createWorkflow({
+  id: "production-ai-workflow",
+  inputSchema: workflowInputSchema,
+  outputSchema: z.object({
+    analysis: z.object({
+      totalIssues: z.number(),
+      openIssues: z.number(),
+      closedIssues: z.number(),
+      topLabels: z.array(z.string())
+    }),
+    brd: z.string(),
+    brdPosted: z.boolean(),
+    taskDistribution: z.object({
+      designTasks: z.number(),
+      frontendTasks: z.number(),
+      backendTasks: z.number(),
+      devopsTasks: z.number(),
+      testingTasks: z.number(),
+      documentationTasks: z.number(),
+      integrationTasks: z.number()
+    }),
+    executionResults: z.object({
+      designResults: z.array(taskExecutionResultSchema),
+      frontendResults: z.array(taskExecutionResultSchema),
+      backendResults: z.array(taskExecutionResultSchema),
+      devopsResults: z.array(taskExecutionResultSchema),
+      testingResults: z.array(taskExecutionResultSchema),
+      documentationResults: z.array(taskExecutionResultSchema),
+      integrationResults: z.array(taskExecutionResultSchema)
+    }),
+    publishSummary: z.object({
+      totalTasks: z.number(),
+      successful: z.number(),
+      failed: z.number(),
+      published: z.number()
+    })
+  })
+})
+.then(createStep({
+  id: "orchestrate-production-workflow",
+  description: "🎭 Orchestrate the complete AI production workflow with parallel agent execution",
+  inputSchema: workflowInputSchema,
+  outputSchema: z.object({
+    analysis: z.object({
+      totalIssues: z.number(),
+      openIssues: z.number(),
+      closedIssues: z.number(),
+      topLabels: z.array(z.string())
+    }),
+    brd: z.string(),
+    brdPosted: z.boolean(),
+    taskDistribution: z.object({
+      designTasks: z.number(),
+      frontendTasks: z.number(),
+      backendTasks: z.number(),
+      devopsTasks: z.number(),
+      testingTasks: z.number(),
+      documentationTasks: z.number(),
+      integrationTasks: z.number()
+    }),
+    executionResults: z.object({
+      designResults: z.array(taskExecutionResultSchema),
+      frontendResults: z.array(taskExecutionResultSchema),
+      backendResults: z.array(taskExecutionResultSchema),
+      devopsResults: z.array(taskExecutionResultSchema),
+      testingResults: z.array(taskExecutionResultSchema),
+      documentationResults: z.array(taskExecutionResultSchema),
+      integrationResults: z.array(taskExecutionResultSchema)
+    }),
+    publishSummary: z.object({
+      totalTasks: z.number(),
+      successful: z.number(),
+      failed: z.number(),
+      published: z.number()
+    })
+  }),
+  execute: async ({ inputData, mastra }) => {
+    console.log(`🎭 Starting Production AI Workflow orchestration...`);
+    
+    // Phase 1: Analysis and BRD Generation
+    console.log(`📋 Phase 1: Analysis and BRD Generation`);
+    const brdResult = await mastra.getWorkflow('analyze-and-generate-brd').execute(inputData);
+    
+    // Phase 2: Task Breakdown and Distribution
+    console.log(`📋 Phase 2: Task Breakdown and Distribution`);
+    const taskDistribution = await mastra.getWorkflow('task-breakdown-and-distribution').execute({
+      owner: brdResult.owner,
+      repo: brdResult.repo,
+      projectContext: brdResult.projectContext,
+      executionConfig: brdResult.executionConfig,
+      brd: brdResult.brd
+    });
+    
+    if (!brdResult.executionConfig.enableTaskExecution) {
+      console.log(`⏭️ Task execution disabled, skipping agent execution phases`);
+      return {
+        analysis: brdResult.analysis,
+        brd: brdResult.brd,
+        brdPosted: brdResult.brdPosted,
+        taskDistribution: {
+          designTasks: 0,
+          frontendTasks: 0,
+          backendTasks: 0,
+          devopsTasks: 0,
+          testingTasks: 0,
+          documentationTasks: 0,
+          integrationTasks: 0
+        },
+        executionResults: {
+          designResults: [],
+          frontendResults: [],
+          backendResults: [],
+          devopsResults: [],
+          testingResults: [],
+          documentationResults: [],
+          integrationResults: []
+        },
+        publishSummary: {
+          totalTasks: 0,
+          successful: 0,
+          failed: 0,
+          published: 0
+        }
+      };
     }
+    
+    // Phase 3: Parallel Agent Execution
+    console.log(`📋 Phase 3: Parallel Specialized Agent Execution`);
+    const agentExecutionPromises = [];
+    
+    // Launch all agent workflows in parallel
+    if (taskDistribution.designTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('design-agent-execution').execute({
+          tasks: taskDistribution.designTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'design', ...result }))
+      );
+    }
+    
+    if (taskDistribution.frontendTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('frontend-agent-execution').execute({
+          tasks: taskDistribution.frontendTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'frontend', ...result }))
+      );
+    }
+    
+    if (taskDistribution.backendTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('backend-agent-execution').execute({
+          tasks: taskDistribution.backendTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'backend', ...result }))
+      );
+    }
+    
+    if (taskDistribution.devopsTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('devops-agent-execution').execute({
+          tasks: taskDistribution.devopsTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'devops', ...result }))
+      );
+    }
+    
+    if (taskDistribution.testingTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('testing-agent-execution').execute({
+          tasks: taskDistribution.testingTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'testing', ...result }))
+      );
+    }
+    
+    if (taskDistribution.documentationTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('documentation-agent-execution').execute({
+          tasks: taskDistribution.documentationTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'documentation', ...result }))
+      );
+    }
+    
+    if (taskDistribution.integrationTasks.length > 0) {
+      agentExecutionPromises.push(
+        mastra.getWorkflow('integration-agent-execution').execute({
+          tasks: taskDistribution.integrationTasks,
+          projectContext: taskDistribution.projectContext
+        }).then(result => ({ type: 'integration', ...result }))
+      );
+    }
+    
+    // Wait for all agent executions to complete
+    const agentResults = await Promise.allSettled(agentExecutionPromises);
+    
+    // Organize results by agent type
+    const executionResults = {
+      designResults: [],
+      frontendResults: [],
+      backendResults: [],
+      devopsResults: [],
+      testingResults: [],
+      documentationResults: [],
+      integrationResults: []
+    } as any;
+    
+    agentResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        const { type, results } = result.value as any;
+        executionResults[`${type}Results`] = results;
+      } else {
+        console.error(`❌ Agent execution failed:`, result.reason);
+      }
+    });
+    
+    // Phase 4: Artifact Publishing
+    console.log(`📋 Phase 4: Artifact Publishing`);
+    const allTasks = [
+      ...taskDistribution.designTasks,
+      ...taskDistribution.frontendTasks,
+      ...taskDistribution.backendTasks,
+      ...taskDistribution.devopsTasks,
+      ...taskDistribution.testingTasks,
+      ...taskDistribution.documentationTasks,
+      ...taskDistribution.integrationTasks
+    ];
+    
+    const allResults = [
+      ...executionResults.designResults,
+      ...executionResults.frontendResults,
+      ...executionResults.backendResults,
+      ...executionResults.devopsResults,
+      ...executionResults.testingResults,
+      ...executionResults.documentationResults,
+      ...executionResults.integrationResults
+    ];
+    
+    const publishResult = await mastra.getWorkflow('artifact-publishing').execute({
+      owner: taskDistribution.owner,
+      repo: taskDistribution.repo,
+      allTasks,
+      allResults
+    });
+    
+    console.log(`🎉 Production AI Workflow orchestration complete!`);
+    
+    return {
+      analysis: brdResult.analysis,
+      brd: brdResult.brd,
+      brdPosted: brdResult.brdPosted,
+      taskDistribution: {
+        designTasks: taskDistribution.designTasks.length,
+        frontendTasks: taskDistribution.frontendTasks.length,
+        backendTasks: taskDistribution.backendTasks.length,
+        devopsTasks: taskDistribution.devopsTasks.length,
+        testingTasks: taskDistribution.testingTasks.length,
+        documentationTasks: taskDistribution.documentationTasks.length,
+        integrationTasks: taskDistribution.integrationTasks.length
+      },
+      executionResults,
+      publishSummary: publishResult.summary
+    };
   }
-  
-  return results;
-}
+}))
+.commit();
 
 // Helper function to parse tasks from breakdown text
 function parseTasksFromBreakdown(breakdownText: string) {
@@ -975,49 +1365,16 @@ function parseTasksFromBreakdown(breakdownText: string) {
   return tasks;
 }
 
-// Main Production Workflow
-export const prodWorkflow = createWorkflow({
-  id: "production-ai-workflow",
-  inputSchema: workflowInputSchema,
-  outputSchema: z.object({
-    analysis: z.object({
-      totalIssues: z.number(),
-      openIssues: z.number(),
-      closedIssues: z.number(),
-      topLabels: z.array(z.string())
-    }),
-    brd: z.string(),
-    brdPosted: z.boolean(),
-    tasks: z.array(z.any()),
-    executionResults: z.array(taskExecutionResultSchema),
-    publishResults: z.array(z.any()),
-    summary: z.object({
-      totalTasks: z.number(),
-      successful: z.number(),
-      failed: z.number(),
-      published: z.number()
-    })
-  })
-})
-.then(analyzeIssuesStep)
-.then(generateBRDStep)
-.then(breakdownTasksStep)
-.then(coordinateTaskExecutionStep)
-.then(publishArtifactsStep)
-.commit();
-
-// Export individual steps for potential standalone use
+// Export all workflows for individual use
 export {
-  analyzeIssuesStep,
-  generateBRDStep,
-  breakdownTasksStep,
-  coordinateTaskExecutionStep,
-  executeDesignTasksStep,
-  executeFrontendTasksStep,
-  executeBackendTasksStep,
-  executeDevOpsTasksStep,
-  executeTestingTasksStep,
-  executeDocumentationTasksStep,
-  executeIntegrationTasksStep,
-  publishArtifactsStep
+  analyzeAndGenerateBRDWorkflow,
+  taskBreakdownWorkflow,
+  designAgentWorkflow,
+  frontendAgentWorkflow,
+  backendAgentWorkflow,
+  devopsAgentWorkflow,
+  testingAgentWorkflow,
+  documentationAgentWorkflow,
+  integrationAgentWorkflow,
+  artifactPublishingWorkflow
 };
